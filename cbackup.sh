@@ -27,20 +27,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+set -x
+
 set -euo pipefail
 shopt -s nullglob dotglob extglob
 
 # Constants
 BACKUP_VERSION="0"
 PASSWORD_CANARY="cbackup-valid"
+REMOTE="adb shell"
 
 # Settings
-tmp_dir="/data/local/tmp/._cbackup_tmp"
-backup_dir="${2:-/sdcard/cbackup}"
+#tmp_dir="/data/local/tmp/._cbackup_tmp"
+tmp_dir="._cbackup_tmp"
+#backup_dir="${2:-/sdcard/cbackup}"
+backup_dir="${2:-cbackup}"
 encryption_args=(-pbkdf2 -iter 200001 -aes-256-ctr)
 debug=false
 # WARNING: Hardcoded password FOR TESTING ONLY!
 #password="cbackup-test!"
+encrypt=false
 # Known broken/problemtic apps to ignore entirely
 app_blacklist=(
     # Restoring Magisk Manager may cause problems with root access
@@ -132,7 +138,7 @@ function get_app_data_sizes() {
     local diskstats pkg_names data_sizes end_idx
     declare -n size_map="$1"
 
-    diskstats="$(dumpsys diskstats)"
+    diskstats="$($REMOTE dumpsys diskstats)"
     mapfile -t pkg_names < <(parse_diskstats_array "$diskstats" "Package Names")
     mapfile -t data_sizes < <(parse_diskstats_array "$diskstats" "App Data Sizes")
     end_idx="$((${#data_sizes[@]} - 1))"
@@ -149,7 +155,7 @@ function get_app_data_sizes() {
 ssaid_restored=false
 termux_restored=false
 app_install_failed=false
-android_version="$(getprop ro.build.version.release | cut -d'.' -f1)"
+android_version="$($REMOTE getprop ro.build.version.release | cut -d'.' -f1)"
 rm -fr "$tmp_dir"
 mkdir -p "$tmp_dir"
 
@@ -176,11 +182,13 @@ function do_backup() {
     rm -fr "$backup_dir"
     mkdir -p "$backup_dir"
 
-    ask_password true
+    if $encrypt; then
+        ask_password true
+    fi
 
     # Get list of user app package names
-    pm list packages --user 0 > "$tmp_dir/pm_all_pkgs.list"
-    pm list packages -s --user 0 > "$tmp_dir/pm_sys_pkgs.list"
+    $REMOTE pm list packages --user 0 > "$tmp_dir/pm_all_pkgs.list"
+    $REMOTE pm list packages -s --user 0 > "$tmp_dir/pm_sys_pkgs.list"
     local apps
     apps="$(grep -vf "$tmp_dir/pm_sys_pkgs.list" "$tmp_dir/pm_all_pkgs.list" | sed 's/package://g')"
 
@@ -207,29 +215,37 @@ function do_backup() {
         local app_out app_info
         app_out="$backup_dir/$app"
         mkdir "$app_out"
-        app_info="$(dumpsys package "$app")"
+        app_info="$($REMOTE dumpsys package "$app")"
 
         # cbackup metadata
         echo "$BACKUP_VERSION" > "$app_out/backup_version.txt"
-        echo -n "$PASSWORD_CANARY" | encrypt_to_file "$app_out/password_canary.enc"
+        if $encrypt; then
+            echo -n "$PASSWORD_CANARY" | encrypt_to_file "$app_out/password_canary.enc"
+        fi
 
         # APKs
         msg "    • APK"
         mkdir "$app_out/apk"
         local apk_dir
         apk_dir="$(grep "codePath=" <<< "$app_info" | sed 's/^\s*codePath=//')"
-        cp "$apk_dir/"*.apk "$app_out/apk"
+        if [[ -n $REMOTE ]]; then
+            $REMOTE tar -cf - -C $apk_dir/ . | tar -xf - -C "$app_out/apk"
+        else
+            cp -r "$apk_dir/." "$app_out/apk/."
+        fi
 
         # Data
         msg "    • Data"
-        pushd / > /dev/null
+        if [[ -z $REMOTE ]]; then
+            pushd / > /dev/null
+        fi
 
         # Collect list of files
         local files=(
             # CE data for user 0
-            "data/data/$app/"!(@(cache|code_cache|no_backup)) \
+            "/data/data/$app/"!(@(cache|code_cache|no_backup)) \
             # DE data for user 0
-            "data/user_de/0/$app/"!(@(cache|code_cache|no_backup))
+            "/data/user_de/0/$app/"!(@(cache|code_cache|no_backup))
         )
 
         # Skip backup if file list is empty
@@ -238,18 +254,18 @@ function do_backup() {
         else
             # Suspend app if possible
             local suspended=false
-            if [[ "$PREFIX" == *"com.termux"* ]] && [[ "$app" == "com.termux" ]]; then
+            if [[ -z $REMOTE ]] && [[ "$PREFIX" == *"com.termux"* ]] && [[ "$app" == "com.termux" ]]; then
                 dbg "Skipping app suspend for Termux because we're running inside it"
             elif [[ "$android_version" -ge 9 ]]; then
                 dbg "Suspending app"
-                pm suspend --user 0 "$app" | expect_output 'new suspended state: true'
+                $REMOTE pm suspend --user 0 "$app" | expect_output 'new suspended state: true'
                 suspended=true
             else
                 dbg "Skipping app suspend due to old Android version $android_version"
             fi
 
             # Finally, perform backup if we have files to back up
-            tar -cf - "${files[@]}" | \
+            $REMOTE tar -cf - "${files[@]}" | \
                 progress_cmd -s "${app_data_sizes[$app]:-0}" |
                 zstd -T0 - | \
                 encrypt_to_file "$app_out/data.tar.zst.enc"
@@ -257,11 +273,13 @@ function do_backup() {
             # Unsuspend the app now that data backup is done
             if $suspended; then
                 dbg "Unsuspending app"
-                pm unsuspend --user 0 "$app" | expect_output 'new suspended state: false'
+                $REMOTE pm unsuspend --user 0 "$app" | expect_output 'new suspended state: false'
             fi
         fi
 
-        popd > /dev/null
+        if [[ -z $REMOTE ]]; then
+            popd > /dev/null
+        fi
 
         # Permissions
         msg "    • Other"
@@ -272,12 +290,13 @@ function do_backup() {
             || true
 
         # SSAID
-        if grep -q 'package="'"$app"'"' /data/system/users/0/settings_ssaid.xml; then
-            grep 'package="'"$app"'"' /data/system/users/0/settings_ssaid.xml > "$app_out/ssaid.xml"
+        ssaid=$($REMOTE grep -q "package=.$app." /data/system/users/0/settings_ssaid.xml)
+        if [[ -n $ssaid ]]; then
+            echo $ssaid > "$app_out/ssaid.xml"
         fi
 
         # Battery optimization
-        if grep -q "$app" /data/system/deviceidle.xml; then
+        if $REMOTE grep -q "$app" /data/system/deviceidle.xml; then
             touch "$app_out/battery_opt_disabled"
         fi
 
@@ -318,7 +337,7 @@ function do_restore() {
     echo
 
     local installed_apps
-    installed_apps="$(pm list packages --user 0 | sed 's/package://g')"
+    installed_apps="$($REMOTE pm list packages --user 0 | sed 's/package://g')"
 
     local app
     for app in "${apps[@]}"
@@ -344,7 +363,7 @@ function do_restore() {
 
         # Check whether we need special in-place restoration for Termux
         local termux_inplace
-        if [[ "$PREFIX" == *"com.termux"* ]] && [[ "$app" == "com.termux" ]]; then
+        if [[ -z $REMOTE ]] && [[ "$PREFIX" == *"com.termux"* ]] && [[ "$app" == "com.termux" ]]; then
             termux_inplace=true
             dbg "Performing in-place Termux restore"
         else
@@ -365,7 +384,7 @@ function do_restore() {
             # permissions, etc.
             if grep -q "$app" <<< "$installed_apps"; then
                 dbg "Uninstalling old copy of app"
-                pm uninstall --user 0 "$app" | expect_output Success
+                $REMOTE pm uninstall --user 0 "$app" | expect_output Success
             fi
 
             # Prepare to invoke pm install
@@ -391,7 +410,7 @@ function do_restore() {
 
             # Install split APKs
             local pm_session
-            pm_session="$(pm install-create "${pm_install_args[@]}" | sed 's/^.*\[\([[:digit:]]*\)\].*$/\1/')"
+            pm_session="$($REMOTE pm install-create "${pm_install_args[@]}" | sed 's/^.*\[\([[:digit:]]*\)\].*$/\1/')"
             dbg "PM session: $pm_session"
 
             local apk
@@ -404,7 +423,7 @@ function do_restore() {
                 split_name="$(basename "$apk")"
 
                 dbg "Writing $apk_size-byte APK $apk with split name $split_name to session $pm_session"
-                cat "$apk" | pm install-write -S "$apk_size" "$pm_session" "$split_name" | expect_output Success
+                cat "$apk" | $REMOTE pm install-write -S "$apk_size" "$pm_session" "$split_name" | expect_output Success
             done
 
             pm install-commit "$pm_session" | expect_output Success || {
@@ -416,7 +435,7 @@ function do_restore() {
             }
 
             if [[ "$android_version" -ge 9 ]]; then
-                pm suspend --user 0 "$app" | expect_output 'new suspended state: true'
+                $REMOTE pm suspend --user 0 "$app" | expect_output 'new suspended state: true'
                 suspended=true
             else
                 dbg "Skipping app suspend due to old Android version $android_version"
@@ -425,7 +444,7 @@ function do_restore() {
 
         # Get info of newly installed app
         local app_info
-        app_info="$(dumpsys package "$app")"
+        app_info="$($REMOTE dumpsys package "$app")"
 
         # Data
         msg "    • Data"
@@ -451,8 +470,8 @@ function do_restore() {
         # No extra slash here because both are supposed to be absolute paths
         local new_data_dir="$out_root_dir$data_dir"
         dbg "New temporary data directory is $new_data_dir"
-        mkdir -p "$new_data_dir"
-        chmod 700 "$new_data_dir"
+        $REMOTE mkdir -p "$new_data_dir"
+        $REMOTE chmod 700 "$new_data_dir"
 
         # Get UID and GIDs
         local uid
@@ -466,7 +485,7 @@ function do_restore() {
         # tools for this.
         # TODO: Fix the sporadic failure codes instead of silencing them with a declaration
         # shellcheck disable=SC2012
-        local secontext="$(/system/bin/ls -a1Z "$data_dir" | head -1 | cut -d' ' -f1)"
+        local secontext="$($REMOTE /system/bin/ls -a1Z "$data_dir" | head -1 | cut -d' ' -f1)"
         dbg "App SELinux context is $secontext"
 
         # Finally, extract the app data
@@ -476,24 +495,24 @@ function do_restore() {
             decrypt_file "$app_dir/data.tar.zst.enc" | \
                 zstd -d -T0 - | \
                 progress_cmd | \
-                tar -C "$out_root_dir" -xf -
+                $REMOTE tar -C "$out_root_dir" -xf -
         else
             echo "No data backup found"
         fi
 
         # Fix ownership
         dbg "Updating data owner to $uid"
-        chown -R "$uid:$uid" "$new_data_dir" "$de_data_dir"
+        $REMOTE chown -R "$uid:$uid" "$new_data_dir" "$de_data_dir"
         local cache_dirs=("$new_data_dir/"*cache* "$de_data_dir/"*cache*)
         if [[ ${#cache_dirs[@]} -ne 0 ]]; then
             dbg "Updating cache owner group to $gid_cache"
-            chown -R "$uid:$gid_cache" "$new_data_dir/"*cache* "$de_data_dir/"*cache*
+            $REMOTE chown -R "$uid:$gid_cache" "$new_data_dir/"*cache* "$de_data_dir/"*cache*
         fi
 
         # Fix SELinux context
         dbg "Updating SELinux context to $secontext"
         # We need to use Android chcon to avoid "Operation not supported on transport endpoint" errors
-        /system/bin/chcon -hR "$secontext" "$new_data_dir" "$de_data_dir"
+        $REMOTE /system/bin/chcon -hR "$secontext" "$new_data_dir" "$de_data_dir"
 
         # Perform in-place Termux hotswap if necessary
         if $termux_inplace; then
@@ -504,7 +523,7 @@ function do_restore() {
             # but we can't get around that without using the relatively new
             # renameat(2) syscall, which isn't exposed by coreutils.
             dbg "Swapping out current data directory"
-            mv "$data_dir" "$out_root_dir/_old_data"
+            $REMOTE mv "$data_dir" "$out_root_dir/_old_data"
 
             # ---------------------- DANGER DANGER DANGER ----------------------
             # We need to be careful with the commands we use here because Termux
@@ -517,16 +536,16 @@ function do_restore() {
             # Swap in the new one ASAP
             # LD_PRELOAD points to a file in Termux, so we need to unset it temporarily
             dbg "Switching to new data directory"
-            (unset LD_PRELOAD; /system/bin/mv "$new_data_dir" "$data_dir")
+            ($REMOTE env -u LD_PRELOAD /system/bin/mv "$new_data_dir" "$data_dir")
 
             # Update cwd for the new directory inode
             # Fall back to Termux HOME if cwd doesn't exist in the restored env
             dbg "Updating $PWD CWD"
-            cd "$PWD" || cd "$HOME"
+            $REMOTE cd "$PWD" || $REMOTE cd "$HOME"
 
             # Rehash PATH cache since we might have new executable paths now
             dbg "Refreshing shell PATH cache"
-            hash -r
+            $REMOTE hash -r
 
             # Check for the presence of optional commands again
             dbg "Re-checking for optional commands"
@@ -541,7 +560,7 @@ function do_restore() {
             # Clean up temporary directory structures and old data directory left
             # over from swapping
             dbg "Deleting old app data directory"
-            rm -fr "$out_root_dir"
+            $REMOTE rm -fr "$out_root_dir"
 
             # Set flag to print Termux restoration warning
             termux_restored=true
@@ -553,26 +572,26 @@ function do_restore() {
         for perm in $(cat "$app_dir/permissions.list")
         do
             dbg "Granting permission $perm"
-            pm grant --user 0 "$app" "$perm" || warn "Failed to grant permission $perm!"
+            $REMOTE pm grant --user 0 "$app" "$perm" || warn "Failed to grant permission $perm!"
         done
 
         # SSAID
         if [[ -f "$app_dir/ssaid.xml" ]]; then
             dbg "Restoring SSAID: $(cat "$app_dir/ssaid.xml")"
-            cat "$app_dir/ssaid.xml" >> /data/system/users/0/settings_ssaid.xml
+            cat "$app_dir/ssaid.xml" | $REMOTE tee -a /data/system/users/0/settings_ssaid.xml >/dev/null
             ssaid_restored=true
         fi
 
         # Battery optimization
         if [[ -f "$app_dir/battery_opt_disabled" ]]; then
             dbg "Whitelisting in deviceidle"
-            dumpsys deviceidle whitelist "+$app" | expect_output Added
+            $REMOTE dumpsys deviceidle whitelist "+$app" | expect_output Added
         fi
 
         # Unsuspend app now that restoration is finished
         if $suspended; then
             dbg "Unsuspending app"
-            pm unsuspend --user 0 "$app" | expect_output 'new suspended state: false'
+            $REMOTE pm unsuspend --user 0 "$app" | expect_output 'new suspended state: false'
         fi
 
         echo
